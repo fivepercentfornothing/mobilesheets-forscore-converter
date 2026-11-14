@@ -1,7 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 import gzip
+import inspect
 import plistlib
 import struct
+import tempfile
 import unittest
+from pathlib import Path
 
 import msb_to_forscore as converter
 import msf_to_forscore as core
@@ -106,6 +110,63 @@ class MobileSheetsBackupTests(unittest.TestCase):
         package = {}
         core.add_forscore_metadata(package, "Score.pdf", {"collections": ["Collection A", "Collection B"]})
         self.assertEqual(package["Score.pdf|labels"], "Collection A, Collection B")
+
+    def test_single_collection_defaults_to_labels_and_can_be_routed_to_tags(self):
+        package = {}
+        core.add_forscore_metadata(package, "Score.pdf", {"collection": "Choir"})
+        self.assertEqual(package["Score.pdf|labels"], "Choir")
+
+        tagged_package = {}
+        core.add_forscore_metadata(
+            tagged_package,
+            "Score.pdf",
+            {"collection": "Choir", "collection_field": "keywords"},
+        )
+        self.assertEqual(tagged_package["Score.pdf|keywords"], "Choir")
+
+    def test_library_conversion_defaults_collections_to_labels(self):
+        default = inspect.signature(converter.convert_database).parameters["collection_field"].default
+        self.assertEqual(default, "labels")
+
+    def test_library_canvas_size_is_read_from_reference_file(self):
+        png = bytearray(24)
+        png[:8] = b"\x89PNG\r\n\x1a\n"
+        struct.pack_into(">II", png, 16, 640, 960)
+        reference = {"Reference.pdf|1.png": bytes(png)}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "reference.4sc"
+            path.write_bytes(gzip.compress(plistlib.dumps(reference), mtime=0))
+            self.assertEqual(converter.canvas_size(path), (640, 960))
+
+    def test_library_conversion_rejects_missing_canvas_reference(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "output"
+            with self.assertRaisesRegex(ValueError, "requires an annotated forScore .4sc"):
+                converter.convert_database(Path(temp_dir) / "missing.msb", output_dir, None)
+            self.assertFalse(output_dir.exists())
+
+    def test_generated_readme_reflects_collection_destination(self):
+        counts = {
+            "scores": 1,
+            "setlists": 0,
+            "collections": 1,
+            "supported_annotations": 0,
+            "unsupported_annotations": 0,
+            "cropped_pages": 0,
+            "cropped_scores": 0,
+            "pdf_properties_inspected": 0,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "README.txt"
+            converter.make_output_readme(path, counts, (64, 96))
+            default_text = path.read_text(encoding="utf-8")
+            self.assertIn("collections represented as forScore Labels: 1", default_text)
+            self.assertIn("pass --collection-field keywords to use Tags", default_text)
+
+            converter.make_output_readme(path, counts, (64, 96), "keywords")
+            tags_text = path.read_text(encoding="utf-8")
+            self.assertIn("collections represented as forScore Tags: 1", tags_text)
+            self.assertIn("pass --collection-field labels to use Labels", tags_text)
 
     def test_database_collections_can_be_written_as_forscore_tags(self):
         package = {"Score.pdf|keywords": "Choir"}

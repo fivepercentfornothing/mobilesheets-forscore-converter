@@ -4,7 +4,11 @@ __pycache__/
 
 # Music libraries and generated score packages
 *.msf
+*.msb
+*.mss
 *.4sc
+*.4ss
+*.4sb
 *.pdf
 *.png
 *.jpg

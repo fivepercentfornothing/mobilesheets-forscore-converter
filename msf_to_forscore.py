@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Experimental MobileSheets .msf to forScore .4sc converter.
 
 The current parser reads score metadata and supports MobileSheets pen and
@@ -85,7 +86,10 @@ def read_gzip_plist(path: Path) -> dict:
 def png_dimensions(raw: bytes) -> tuple[int, int]:
     if raw[:8] != b"\x89PNG\r\n\x1a\n" or len(raw) < 24:
         raise ValueError("The forScore reference does not contain a PNG page layer")
-    return struct.unpack_from(">II", raw, 16)
+    width, height = struct.unpack_from(">II", raw, 16)
+    if width == 0 or height == 0:
+        raise ValueError("The forScore reference has invalid annotation-layer dimensions")
+    return width, height
 
 
 def parse_title(header: bytes, fallback: str) -> str:
@@ -531,7 +535,6 @@ def add_forscore_metadata(output: dict, base_name: str, metadata: dict[str, obje
         "title": "title",
         "composer": "composer",
         "genre": "genre",
-        "collection": "labels",
         "keywords": "keywords",
         "reference": "reference",
         "rating": "rating",
@@ -543,22 +546,27 @@ def add_forscore_metadata(output: dict, base_name: str, metadata: dict[str, obje
             output[f"{base_name}|{target_field}"] = value
             transferred.append(target_field)
 
+    collection_field = metadata.get("collection_field", "labels")
+    collection_values: list[str] = []
+    collection = metadata.get("collection")
+    if isinstance(collection, str) and collection.strip():
+        collection_values.append(collection.strip())
     collections = metadata.get("collections")
     if isinstance(collections, (list, tuple)):
-        collection_field = metadata.get("collection_field", "labels")
-        if collection_field not in {"labels", "keywords"}:
+        collection_values.extend(str(value).strip() for value in collections if str(value).strip())
+    if collection_values:
+        if collection_field not in ("labels", "keywords"):
             notes.append(f"Unsupported forScore collection field {collection_field!r}; collections were not added")
         else:
             values: list[str] = []
             existing = output.get(f"{base_name}|{collection_field}")
             if isinstance(existing, str):
                 values.extend(part.strip() for part in existing.split(",") if part.strip())
-            values.extend(str(value).strip() for value in collections if str(value).strip())
+            values.extend(collection_values)
             values = list(dict.fromkeys(values))
-            if values:
-                # forScore Tags and Labels both use comma-separated values.
-                output[f"{base_name}|{collection_field}"] = ", ".join(values)
-                transferred.append(collection_field)
+            # forScore Tags (keywords) and Labels both use comma-separated values.
+            output[f"{base_name}|{collection_field}"] = ", ".join(values)
+            transferred.append(collection_field)
 
     duration = metadata.get("duration_seconds")
     if isinstance(duration, int):
@@ -598,6 +606,7 @@ def convert(
     pen_width_scale: float | None = None,
     highlighter_width_scale: float | None = None,
     collection_label: str | None = None,
+    collection_field: str = "labels",
 ) -> None:
     if not math.isfinite(smoothing) or not 0 <= smoothing <= 1:
         raise ValueError("Smoothing must be a number between 0 and 1")
@@ -607,10 +616,13 @@ def convert(
         not math.isfinite(highlighter_width_scale) or highlighter_width_scale < 0
     ):
         raise ValueError("Width scales must be finite, non-negative numbers")
+    if collection_field not in {"labels", "keywords"}:
+        raise ValueError("Collection field must be 'labels' or 'keywords' (forScore Tags)")
 
     sample = parse_msf(msf_path, collection_label)
     output, base_name, pdf = forscore_package(template_path, sample)
-    transferred_metadata, metadata_notes = add_forscore_metadata(output, base_name, sample.metadata)
+    metadata = {**sample.metadata, "collection_field": collection_field}
+    transferred_metadata, metadata_notes = add_forscore_metadata(output, base_name, metadata)
     reference = read_gzip_plist(reference_path)
     png_reference = next(
         (value for key, value in reference.items() if isinstance(key, str) and key.endswith(".png") and isinstance(value, bytes)),
@@ -690,6 +702,12 @@ def main() -> None:
     parser.add_argument("--template", type=Path, help="Optional clean forScore .4sc for the same score; otherwise the embedded MobileSheets PDF is used")
     parser.add_argument("--collection-label", help="Optional forScore label to apply to every converted score in a collection export")
     parser.add_argument(
+        "--collection-field",
+        choices=("labels", "keywords"),
+        default="labels",
+        help="forScore destination for MobileSheets collections: Labels by default, or Tags via keywords",
+    )
+    parser.add_argument(
         "--smoothing",
         type=float,
         default=DEFAULT_SMOOTHING,
@@ -717,6 +735,7 @@ def main() -> None:
         pen_width_scale=args.pen_width_scale,
         highlighter_width_scale=args.highlighter_width_scale,
         collection_label=args.collection_label,
+        collection_field=args.collection_field,
     )
 
 

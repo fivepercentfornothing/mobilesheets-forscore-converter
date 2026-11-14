@@ -1,0 +1,10 @@
+#!/bin/sh
+# Add Codex as a co-author to commits made from this checkout.
+set -eu
+
+message_file=$1
+trailer='Co-authored-by: Codex <noreply@openai.com>'
+
+if ! grep -Fq "$trailer" "$message_file"; then
+    printf '\n%s\n' "$trailer" >> "$message_file"
+fi

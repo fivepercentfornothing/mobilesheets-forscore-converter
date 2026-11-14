@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Convert a MobileSheets .msb library backup into forScore scores and archives.
 
 The reader is based on the MobileSheets 3.9.45 backup layout observed in the
 project's sample export: a versioned header, an embedded SQLite database, then
 PDF records keyed by MobileSheets song ID. It writes one editable .4sc per
-score and one .4ss per MobileSheets setlist. Collections become forScore Tags
+score and one .4ss per MobileSheets setlist. Collections become forScore Labels
 by default. An optional .4sb archive packages the library, metadata, editable
 annotation layers, and setlists. Unsupported annotation types are reported.
 """
@@ -39,7 +40,6 @@ SQLITE_MAGIC = b"SQLite format 3\0"
 PDF_MAGIC = b"%PDF-"
 PDF_RECORD_HEADER_SIZE = 24
 PDF_SENTINEL = 3.4028234663852886e38
-DEFAULT_CANVAS = (3072, 4020)
 ARCHIVE_FORMAT_VERSION = 100000
 FORSCORE_BACKUP_MAGIC = b"<--4SBV03-->"
 FORSCORE_DOCUMENTS_PREFIX = "{%DOCUMENTS_DIR%}/"
@@ -420,9 +420,7 @@ def read_database_contents(database_path: Path, raw: mmap.mmap, database_start: 
         connection.close()
 
 
-def canvas_size(reference_path: Path | None, canvas_width: int, canvas_height: int) -> tuple[int, int]:
-    if not reference_path:
-        return canvas_width, canvas_height
+def canvas_size(reference_path: Path) -> tuple[int, int]:
     reference = core.read_gzip_plist(reference_path)
     for key, value in reference.items():
         if isinstance(key, str) and key.endswith(".png") and isinstance(value, bytes):
@@ -750,18 +748,25 @@ def verify_4sc(path: Path, expected_pdf_size: int) -> dict[str, Any]:
     return package
 
 
-def make_output_readme(path: Path, counts: dict[str, int], canvas: tuple[int, int]) -> None:
+def make_output_readme(
+    path: Path,
+    counts: dict[str, int],
+    canvas: tuple[int, int],
+    collection_field: str = "labels",
+) -> None:
+    collection_name = "Tags" if collection_field == "keywords" else "Labels"
+    alternate_field, alternate_name = ("labels", "Labels") if collection_field == "keywords" else ("keywords", "Tags")
     path.write_text(
         "MobileSheets → forScore conversion\n\n"
         f"Scores: {counts['scores']}\nSetlists: {counts['setlists']}\n"
-        f"MobileSheets collections represented as forScore Tags: {counts['collections']}\n"
+        f"MobileSheets collections represented as forScore {collection_name}: {counts['collections']}\n"
         f"Converted pen/highlighter annotation records: {counts['supported_annotations']}\n"
         f"Unsupported annotation records: {counts['unsupported_annotations']}\n"
         f"Non-default MobileSheets crop settings not applied: {counts['cropped_pages']} pages across {counts['cropped_scores']} scores\n"
         f"PDF property rows inspected: {counts['pdf_properties_inspected']}\n"
         f"Annotation layer size: {canvas[0]} × {canvas[1]} pixels\n\n"
-        "Import the .4SC files from scores/ to add individual scores. Each .4SS in setlists/ includes the scores referenced by that list, matching the supplied forScore share-with-scores example. Importing both every .4SC and every .4SS may add the same score more than once depending on forScore's duplicate handling. For a first import, try one .4SS setlist and inspect the result before importing the remaining files.\n\n"
-        "Collection memberships are written to the forScore Tags field (keywords) as comma-separated values by default; pass --collection-field labels to use Labels instead. Unusual composer/genre strings are preserved and listed in metadata-review.csv. embedded-pdf-properties.csv lists the original PDF properties, which remain embedded in the unchanged source PDFs. The manifest records unsupported MobileSheets annotation types. MobileSheets page crop settings are not applied; page-settings-review.csv lists the non-default source pages. In this library, no supported pen/highlighter annotations are on those cropped pages. Bookmarks and per-score playback/metronome settings are not converted in this pass.\n",
+        "Import the .4SC files from scores/ to add individual scores. Each .4SS setlist package includes the scores it references. Importing both every .4SC and every .4SS may add duplicates depending on forScore's duplicate handling. For a first import, try one .4SS setlist and inspect the result before importing the remaining files.\n\n"
+        f"Collection memberships are written to forScore {collection_name} by default; pass --collection-field {alternate_field} to use {alternate_name}. Unusual composer/genre strings are preserved and listed in metadata-review.csv. embedded-pdf-properties.csv lists the original PDF properties, which remain embedded in the unchanged source PDFs. The manifest records unsupported MobileSheets annotation types. MobileSheets page crop settings are not applied; page-settings-review.csv lists the non-default source pages. Annotations on cropped pages may not align as they did in MobileSheets, so verify those pages after import. Bookmarks and per-score playback/metronome settings are not converted in this pass.\n",
         encoding="utf-8",
     )
 
@@ -769,13 +774,11 @@ def make_output_readme(path: Path, counts: dict[str, int], canvas: tuple[int, in
 def convert_database(
     source: Path,
     output_dir: Path,
-    reference_4sc: Path | None = None,
+    reference_4sc: Path,
     smoothing: float = core.DEFAULT_SMOOTHING,
     pen_width_scale: float | None = None,
     highlighter_width_scale: float | None = None,
-    canvas_width: int = DEFAULT_CANVAS[0],
-    canvas_height: int = DEFAULT_CANVAS[1],
-    collection_field: str = "keywords",
+    collection_field: str = "labels",
     zip_path: Path | None = None,
     archive_4sb_path: Path | None = None,
 ) -> dict[str, int]:
@@ -785,6 +788,8 @@ def convert_database(
         raise ValueError("Pen width scale must be finite and non-negative")
     if highlighter_width_scale is not None and (not math.isfinite(highlighter_width_scale) or highlighter_width_scale < 0):
         raise ValueError("Highlighter width scale must be finite and non-negative")
+    if reference_4sc is None:
+        raise ValueError("Library conversion requires an annotated forScore .4sc canvas reference")
     if collection_field not in {"keywords", "labels"}:
         raise ValueError("Collection field must be 'keywords' (forScore Tags) or 'labels'")
     if archive_4sb_path and archive_4sb_path.resolve() == source.resolve():
@@ -794,7 +799,7 @@ def convert_database(
     setlists_dir = output_dir / "setlists"
     scores_dir.mkdir(exist_ok=True)
     setlists_dir.mkdir(exist_ok=True)
-    canvas = canvas_size(reference_4sc, canvas_width, canvas_height)
+    canvas = canvas_size(reference_4sc)
 
     with source.open("rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as raw:
         if raw[:4] != MSB_MAGIC:
@@ -941,7 +946,7 @@ def convert_database(
         "cropped_scores": len({row[0] for row in data.page_settings_review}),
         "pdf_properties_inspected": len(pdf_property_rows) if pdfinfo_available else 0,
     }
-    make_output_readme(output_dir / "README.txt", counts, canvas)
+    make_output_readme(output_dir / "README.txt", counts, canvas, collection_field)
     if archive_4sb_path:
         archive_counts = write_4sb_archive(data, output_paths, archive_4sb_path)
         print(
@@ -974,10 +979,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("backup", type=Path, help="MobileSheets .msb database export")
     parser.add_argument("output_dir", type=Path, help="Directory for generated .4SC and .4SS files")
-    parser.add_argument("--reference-4sc", type=Path, help="Optional annotated forScore .4sc to copy its annotation-layer dimensions")
-    parser.add_argument("--canvas-width", type=int, default=DEFAULT_CANVAS[0], help="Layer width if no .4sc reference is supplied")
-    parser.add_argument("--canvas-height", type=int, default=DEFAULT_CANVAS[1], help="Layer height if no .4sc reference is supplied")
-    parser.add_argument("--collection-field", choices=("keywords", "labels"), default="keywords", help="forScore destination for MobileSheets collections: keywords are Tags (default), labels preserves the earlier prototype mapping")
+    parser.add_argument("--reference-4sc", type=Path, required=True, help="Annotated forScore .4sc used to read annotation-layer dimensions")
+    parser.add_argument("--collection-field", choices=("labels", "keywords"), default="labels", help="forScore destination for MobileSheets collections: Labels by default, or Tags via keywords")
     parser.add_argument("--archive-4sb", type=Path, help="Also build a full forScore backup archive from the converted library")
     parser.add_argument("--smoothing", type=float, default=core.DEFAULT_SMOOTHING, help="Pen smoothing from 0 (off) to 1 (strong)")
     parser.add_argument("--pen-width-scale", type=float, default=None, help="Override the empirical pen width curve")
@@ -991,8 +994,6 @@ def main() -> None:
         smoothing=args.smoothing,
         pen_width_scale=args.pen_width_scale,
         highlighter_width_scale=args.highlighter_width_scale,
-        canvas_width=args.canvas_width,
-        canvas_height=args.canvas_height,
         collection_field=args.collection_field,
         zip_path=args.zip_path,
         archive_4sb_path=args.archive_4sb,
